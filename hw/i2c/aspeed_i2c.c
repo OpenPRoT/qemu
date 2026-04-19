@@ -153,6 +153,7 @@ static uint64_t aspeed_i2c_bus_new_read(AspeedI2CBus *bus, hwaddr offset,
     case A_I2CM_DMA_LEN_STS:
     case A_I2CC_DMA_LEN:
     case A_I2CS_DEV_ADDR:
+    case A_I2CS_DMA_TX_ADDR:
     case A_I2CS_DMA_RX_ADDR:
     case A_I2CS_DMA_LEN:
     case A_I2CS_CMD:
@@ -272,6 +273,26 @@ static void aspeed_i2c_set_rx_dma_dram_offset(AspeedI2CBus *bus)
         value = bus->regs[R_I2CD_DMA_ADDR];
         bus->dma_dram_offset = deposit64(bus->dma_dram_offset, 0, 32,
                                          value & 0x3ffffffc);
+    }
+}
+
+static void aspeed_i2c_set_slave_tx_dma_dram_offset(AspeedI2CBus *bus)
+{
+    AspeedI2CClass *aic = ASPEED_I2C_GET_CLASS(bus->controller);
+    uint32_t value;
+
+    assert(aic->has_dma);
+    assert(aspeed_i2c_is_new_mode(bus->controller));
+
+    value = bus->regs[R_I2CS_DMA_TX_ADDR];
+    bus->dma_dram_offset =
+        deposit64(bus->dma_dram_offset, 0, 32,
+                  FIELD_EX32(value, I2CS_DMA_TX_ADDR, ADDR));
+    if (aic->has_dma64) {
+        value = bus->regs[R_I2CS_DMA_TX_ADDR_HI];
+        bus->dma_dram_offset =
+            deposit64(bus->dma_dram_offset, 32, 32,
+                      extract32(value, 0, 2));
     }
 }
 
@@ -818,8 +839,7 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
         bus->regs[R_I2CS_DMA_LEN_STS] = 0;
         break;
     case A_I2CS_DMA_TX_ADDR:
-        qemu_log_mask(LOG_UNIMP, "%s: Slave mode DMA TX is not implemented\n",
-                      __func__);
+        bus->regs[R_I2CS_DMA_TX_ADDR] = value;
         break;
     case A_I2CM_DMA_TX_ADDR_HI:
         if (!aic->has_dma64) {
@@ -842,9 +862,14 @@ static void aspeed_i2c_bus_new_write(AspeedI2CBus *bus, hwaddr offset,
                                                       ADDR_HI);
         break;
     case A_I2CS_DMA_TX_ADDR_HI:
-        qemu_log_mask(LOG_UNIMP,
-                      "%s: Slave mode DMA TX Addr high is not implemented\n",
-                      __func__);
+        if (!aic->has_dma64) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: No DMA 64 bits support\n",
+                          __func__);
+            break;
+        }
+        bus->regs[R_I2CS_DMA_TX_ADDR_HI] = FIELD_EX32(value,
+                                                      I2CS_DMA_TX_ADDR_HI,
+                                                      ADDR_HI);
         break;
     case A_I2CS_DMA_RX_ADDR_HI:
         if (!aic->has_dma64) {
@@ -1399,11 +1424,32 @@ static int aspeed_i2c_bus_new_slave_event(AspeedI2CBus *bus,
             ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN, RX_BUF_LEN) + 1;
         i2c_ack(bus->bus);
         break;
+    case I2C_START_RECV:
+        /*
+         * External master is about to read from us (slave TX). Only DMA
+         * slave TX is modelled; firmware that tries to drive slave TX via
+         * the pool buffer or byte buffer will still see this path.
+         */
+        if (!SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: Slave mode TX DMA is not enabled\n", __func__);
+            return -1;
+        }
+        ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN, 0);
+        aspeed_i2c_set_slave_tx_dma_dram_offset(bus);
+        bus->regs[R_I2CC_DMA_LEN] =
+            ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN, TX_BUF_LEN) + 1;
+        break;
     case I2C_FINISH:
         ARRAY_FIELD_DP32(bus->regs, I2CS_INTR_STS, PKT_CMD_DONE, 1);
         ARRAY_FIELD_DP32(bus->regs, I2CS_INTR_STS, SLAVE_ADDR_RX_MATCH, 1);
         SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, NORMAL_STOP, 1);
-        SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, RX_DONE, 1);
+        if (SHARED_ARRAY_FIELD_EX32(bus->regs, R_I2CS_CMD, TX_DMA_EN)) {
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, TX_ACK, 1);
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_CMD, TX_DMA_EN, 0);
+        } else {
+            SHARED_ARRAY_FIELD_DP32(bus->regs, R_I2CS_INTR_STS, RX_DONE, 1);
+        }
         aspeed_i2c_bus_raise_slave_interrupt(bus);
         break;
     default:
@@ -1487,6 +1533,57 @@ static void aspeed_i2c_bus_slave_send_async(I2CSlave *slave, uint8_t data)
     aspeed_i2c_bus_raise_interrupt(bus);
 }
 
+static uint8_t aspeed_i2c_bus_new_slave_recv(AspeedI2CBus *bus)
+{
+    AspeedI2CState *s = bus->controller;
+    MemTxResult result;
+    uint8_t data = 0xff;
+
+    if (!bus->regs[R_I2CC_DMA_LEN]) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: slave TX DMA underflow on bus %d\n",
+                      __func__, bus->id);
+        return data;
+    }
+
+    result = address_space_read(&s->dram_as, bus->dma_dram_offset,
+                                MEMTXATTRS_UNSPECIFIED, &data, 1);
+    if (result != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: DRAM read failed @%" PRIx64 "\n",
+                      __func__, bus->dma_dram_offset);
+        return 0xff;
+    }
+
+    trace_aspeed_i2c_bus_send("SLAVE_DMA", bus->regs[R_I2CC_DMA_LEN],
+                              bus->regs[R_I2CC_DMA_LEN], data);
+
+    bus->dma_dram_offset++;
+    bus->regs[R_I2CC_DMA_LEN]--;
+    ARRAY_FIELD_DP32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN,
+                     ARRAY_FIELD_EX32(bus->regs, I2CS_DMA_LEN_STS, TX_LEN) + 1);
+    return data;
+}
+
+static uint8_t aspeed_i2c_bus_slave_recv(I2CSlave *slave)
+{
+    BusState *qbus = qdev_get_parent_bus(DEVICE(slave));
+    AspeedI2CBus *bus = ASPEED_I2C_BUS(qbus->parent);
+
+    if (aspeed_i2c_is_new_mode(bus->controller)) {
+        return aspeed_i2c_bus_new_slave_recv(bus);
+    }
+
+    /*
+     * Old-mode slave TX is not modelled. Return idle bus value so a
+     * misconfigured firmware sees something deterministic rather than
+     * random data.
+     */
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: Old-mode slave TX is not implemented\n", __func__);
+    return 0xff;
+}
+
 static void aspeed_i2c_bus_slave_class_init(ObjectClass *klass,
                                             const void *data)
 {
@@ -1497,6 +1594,7 @@ static void aspeed_i2c_bus_slave_class_init(ObjectClass *klass,
 
     sc->event = aspeed_i2c_bus_slave_event;
     sc->send_async = aspeed_i2c_bus_slave_send_async;
+    sc->recv = aspeed_i2c_bus_slave_recv;
 }
 
 static const TypeInfo aspeed_i2c_bus_slave_info = {
