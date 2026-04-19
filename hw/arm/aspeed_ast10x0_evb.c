@@ -16,6 +16,7 @@
 #include "system/system.h"
 #include "hw/i2c/smbus_eeprom.h"
 #include "hw/sensor/tmp105.h"
+#include "hw/sensor/isl_pmbus_vr.h"
 
 #define AST1030_INTERNAL_FLASH_SIZE (1024 * 1024)
 /* Main SYSCLK frequency in Hz (200MHz) */
@@ -105,6 +106,41 @@ static void ast1030_evb_i2c_init(AspeedMachineState *bmc)
                             0x48);
 }
 
+static void ast1060_evb_i2c_init(AspeedMachineState *bmc)
+{
+    AspeedSoCState *soc = bmc->soc;
+
+    /*
+     * The AST1060 Platform Root of Trust EVB also exposes 14 I2C buses
+     * via the shared AST10x0 SoC model. The layout here reflects the
+     * reference schematic - a small mix of sensors, EEPROMs, IO
+     * expanders, and a PMBus voltage regulator that firmware probes
+     * during attestation/telemetry bring-up.
+     *
+     *   Bus 0 : 24C08 EEPROM              @ 0x50   (config EEPROM)
+     *   Bus 1 : TMP105                    @ 0x4c   (core temperature)
+     *   Bus 2 : PCA9552                   @ 0x60   (status LEDs)
+     *   Bus 3 : PCA9554                   @ 0x20   (miscellaneous GPIO)
+     *   Bus 4 : ISL69259 PMBus VR         @ 0x60   (core voltage rail)
+     *   Bus 5 : 24C08 EEPROM              @ 0x51   (PRoT secure store)
+     */
+
+    uint8_t *eeprom0_buf = g_malloc0(32 * 1024);
+    smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 0), 0x50, eeprom0_buf);
+
+    i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1), TYPE_TMP105,
+                            0x4c);
+
+    aspeed_create_pca9552(soc, 2, 0x60);
+    aspeed_create_pca9554(soc, 3, 0x20);
+
+    i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 4), TYPE_ISL69259,
+                            0x60);
+
+    uint8_t *eeprom1_buf = g_malloc0(32 * 1024);
+    smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 5), 0x51, eeprom1_buf);
+}
+
 static void aspeed_minibmc_machine_ast1030_evb_class_init(ObjectClass *oc,
                                                           const void *data)
 {
@@ -136,6 +172,7 @@ static void aspeed_minibmc_machine_ast1060_evb_class_init(ObjectClass *oc,
     amc->hw_strap1 = 0;
     amc->hw_strap2 = 0;
     mc->init = aspeed_minibmc_machine_init;
+    amc->i2c_init = ast1060_evb_i2c_init;
     amc->fmc_model = "w25q80bl";
     amc->spi_model = "w25q02jvm";
     amc->num_cs = 2;

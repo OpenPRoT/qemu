@@ -551,6 +551,7 @@ config ASPEED_SOC
     select UNIMP
     select LED
     select PMBUS
+    select ISL_PMBUS_VR
     select MAX31785
     select FSI_APB2OPB_ASPEED
     select AT24C
