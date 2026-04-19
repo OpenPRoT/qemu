@@ -15,6 +15,7 @@
 #include "hw/core/qdev-clock.h"
 #include "system/system.h"
 #include "hw/i2c/smbus_eeprom.h"
+#include "hw/sensor/tmp105.h"
 
 #define AST1030_INTERNAL_FLASH_SIZE (1024 * 1024)
 /* Main SYSCLK frequency in Hz (200MHz) */
@@ -68,12 +69,40 @@ static void ast1030_evb_i2c_init(AspeedMachineState *bmc)
 {
     AspeedSoCState *soc = bmc->soc;
 
-    /* U10 24C08 connects to SDA/SCL Group 1 by default */
-    uint8_t *eeprom_buf = g_malloc0(32 * 1024);
-    smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 0), 0x50, eeprom_buf);
+    /*
+     * The AST1030 MiniBMC EVB exposes 14 I2C buses. The layout below
+     * follows the reference schematic and matches the slave layout that
+     * Aspeed's Zephyr SDK probes at boot:
+     *
+     *   Bus 0 : U10 24C08 EEPROM at 0x50
+     *   Bus 1 : U11 LM75 (TMP105-compatible) at 0x4d
+     *   Bus 2 : PCA9552 16-bit LED/GPIO expander at 0x60
+     *   Bus 3 : second 24C08 EEPROM at 0x51 (expansion header)
+     *   Bus 4 : PCA9554 8-bit IO expander at 0x20
+     *   Bus 5 : spare TMP105 at 0x48 (optional daughter-card sensor)
+     */
 
-    /* U11 LM75 connects to SDA/SCL Group 2 by default */
-    i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1), "tmp105", 0x4d);
+    /* Bus 0: primary configuration EEPROM */
+    uint8_t *eeprom0_buf = g_malloc0(32 * 1024);
+    smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 0), 0x50, eeprom0_buf);
+
+    /* Bus 1: on-board temperature sensor */
+    i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 1), TYPE_TMP105,
+                            0x4d);
+
+    /* Bus 2: LED/GPIO expander */
+    aspeed_create_pca9552(soc, 2, 0x60);
+
+    /* Bus 3: expansion EEPROM */
+    uint8_t *eeprom1_buf = g_malloc0(32 * 1024);
+    smbus_eeprom_init_one(aspeed_i2c_get_bus(&soc->i2c, 3), 0x51, eeprom1_buf);
+
+    /* Bus 4: general-purpose IO expander */
+    aspeed_create_pca9554(soc, 4, 0x20);
+
+    /* Bus 5: optional secondary temperature sensor */
+    i2c_slave_create_simple(aspeed_i2c_get_bus(&soc->i2c, 5), TYPE_TMP105,
+                            0x48);
 }
 
 static void aspeed_minibmc_machine_ast1030_evb_class_init(ObjectClass *oc,
